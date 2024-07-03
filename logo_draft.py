@@ -48,7 +48,7 @@ def send_generation_request(
 
 # SD3 Large
 
-prompt = "flowers in a vase" #param {type:"string"}
+prompt = "enter sample text" #param {type:"string"}
 negative_prompt = "" #@param {type:"string"}
 aspect_ratio = "1:1" #@param ["21:9", "16:9", "3:2", "5:4", "1:1", "4:5", "2:3", "9:16", "9:21"]
 seed = 0 #@param {type:"integer"}
