@@ -1,143 +1,131 @@
 import torch
 import torch.nn as nn
-from transformers import LLaMAModel, LLaMATokenizer
+from transformers import LlamaModel, LlamaTokenizer, LlamaForCausalLM
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import WandbLogger
 import wandb
+from typing import List, Tuple
+import argparse
 
 class MultiModalLLAMA(nn.Module):
-    def __init__(self, llama_model_name):
+    def __init__(self, llama_model_name: str):
         super().__init__()
         
-        # Load the LLAMA model and tokenizer
-        self.llama = LLaMAModel.from_pretrained(llama_model_name)
-        self.tokenizer = LLaMATokenizer.from_pretrained(llama_model_name)
+        self.llama = LlamaModel.from_pretrained(llama_model_name)
+        self.tokenizer = LlamaTokenizer.from_pretrained(llama_model_name)
         
-        # Freeze the LLAMA model parameters
         for param in self.llama.parameters():
             param.requires_grad = False
         
-        # Design the multi-modal input embedding layer
-        self.url_embedding = nn.Embedding(len(self.tokenizer), self.llama.config.hidden_size)
-        self.text_embedding = nn.Embedding(len(self.tokenizer), self.llama.config.hidden_size)
-        self.prompt_embedding = nn.Embedding(len(self.tokenizer), self.llama.config.hidden_size)
-        self.description_embedding = nn.Embedding(len(self.tokenizer), self.llama.config.hidden_size)
+        hidden_size = self.llama.config.hidden_size
+        vocab_size = len(self.tokenizer)
         
-        self.input_projection = nn.Linear(
-            self.llama.config.hidden_size * 4, self.llama.config.hidden_size
-        )
+        self.embeddings = nn.ModuleDict({
+            'url': nn.Embedding(vocab_size, hidden_size),
+            'text': nn.Embedding(vocab_size, hidden_size),
+            'prompt': nn.Embedding(vocab_size, hidden_size),
+            'description': nn.Embedding(vocab_size, hidden_size)
+        })
         
-    def forward(self, url, text, prompt, description):
-        # Pass the inputs through the respective embedding layers
-        url_emb = self.url_embedding(url)
-        text_emb = self.text_embedding(text)
-        prompt_emb = self.prompt_embedding(prompt)
-        description_emb = self.description_embedding(description)
+        self.input_projection = nn.Linear(hidden_size * 4, hidden_size)
         
-        # Combine the embeddings using the input projection layer
-        combined_emb = torch.cat([url_emb, text_emb, prompt_emb, description_emb], dim=-1)
+    def forward(self, inputs: dict) -> torch.Tensor:
+        embeddings = [self.embeddings[key](inputs[key]) for key in ['url', 'text', 'prompt', 'description']]
+        combined_emb = torch.cat(embeddings, dim=-1)
         model_input = self.input_projection(combined_emb)
-        
-        # Pass the input through the LLAMA model
-        outputs = self.llama(inputs_embeds=model_input)
-        
-        return outputs
+        return self.llama(inputs_embeds=model_input)
 
 class WebsiteContentGenerator(pl.LightningModule):
-    def __init__(self, llama_model_name, learning_rate):
+    def __init__(self, llama_model_name: str, learning_rate: float):
         super().__init__()
         self.save_hyperparameters()
         
-        # Load the LLAMA model and tokenizer
-        self.llama = LLaMAModel.from_pretrained(llama_model_name)
-        self.tokenizer = LLaMATokenizer.from_pretrained(llama_model_name)
+        self.model = MultiModalLLAMA(llama_model_name)
+        self.tokenizer = self.model.tokenizer
         
-        # Freeze the LLAMA model parameters
-        for param in self.llama.parameters():
-            param.requires_grad = False
-        
-        # Implement the multi-modal input embedding layer
-        self.url_embedding = nn.Embedding(len(self.tokenizer), self.llama.config.hidden_size)
-        self.text_embedding = nn.Embedding(len(self.tokenizer), self.llama.config.hidden_size)
-        self.prompt_embedding = nn.Embedding(len(self.tokenizer), self.llama.config.hidden_size)
-        self.description_embedding = nn.Embedding(len(self.tokenizer), self.llama.config.hidden_size)
-        
-        self.input_projection = nn.Linear(
-            self.llama.config.hidden_size * 4, self.llama.config.hidden_size
-        )
-        
-    def forward(self, url, text, prompt, description):
-        # Pass the inputs through the respective embedding layers
-        url_emb = self.url_embedding(url)
-        text_emb = self.text_embedding(text)
-        prompt_emb = self.prompt_embedding(prompt)
-        description_emb = self.description_embedding(description)
-        
-        # Combine the embeddings using the input projection layer
-        combined_emb = torch.cat([url_emb, text_emb, prompt_emb, description_emb], dim=-1)
-        model_input = self.input_projection(combined_emb)
-        
-        # Pass the input through the LLAMA model
-        outputs = self.llama(inputs_embeds=model_input)
-        
-        return outputs
+    def forward(self, inputs: dict) -> torch.Tensor:
+        return self.model(inputs)
     
-    def training_step(self, batch, batch_idx):
-        url, text, prompt, description, target = batch
-        outputs = self(url, text, prompt, description)
-        loss = outputs.loss
+    def _compute_loss(self, batch: Tuple[dict, torch.Tensor]) -> torch.Tensor:
+        inputs, targets = batch
+        outputs = self(inputs)
+        return nn.functional.cross_entropy(outputs.logits.view(-1, outputs.logits.size(-1)), targets.view(-1))
+    
+    def training_step(self, batch: Tuple[dict, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        loss = self._compute_loss(batch)
         self.log('train_loss', loss)
         return loss
     
-    def validation_step(self, batch, batch_idx):
-        url, text, prompt, description, target = batch
-        outputs = self(url, text, prompt, description)
-        loss = outputs.loss
+    def validation_step(self, batch: Tuple[dict, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        loss = self._compute_loss(batch)
         self.log('val_loss', loss)
+        return loss
         
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        return optimizer
+        return torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
 
-# Plan the fine-tuning approach using Weights & Biases
-wandb.init(project="website-content-generation")
-config = wandb.config
-config.learning_rate = 2e-5
-config.batch_size = 8
-config.num_epochs = 3
-
-model = WebsiteContentGenerator("path/to/llama-model", learning_rate=config.learning_rate)
-trainer = pl.Trainer(
-    accelerator='gpu',
-    devices=1,
-    max_epochs=config.num_epochs,
-    logger=True,
-    checkpoint_callback=True
-)
-trainer.fit(model, train_dataloader, val_dataloader)
-
-# Generate and optimize website content
-def generate_website_content(model, prompt, max_length=200, num_return_sequences=1):
-    input_ids = model.tokenizer.encode(prompt, return_tensors='pt')
-    output_ids = model.llama.generate(
-        input_ids=input_ids,
-        max_length=max_length,
-        num_return_sequences=num_return_sequences,
-        do_sample=True,
-        top_k=50,
-        top_p=0.95,
-        num_iterations=1
-    )[0]
+def setup_training(args: argparse.Namespace) -> Tuple[WebsiteContentGenerator, pl.Trainer]:
+    wandb.init(project="website-content-generation")
+    model = WebsiteContentGenerator(args.llama_model_path, args.learning_rate)
     
-    generated_text = model.tokenizer.decode(output_ids, skip_special_tokens=True)
-    return generated_text
+    checkpoint_callback = ModelCheckpoint(
+        dirpath='checkpoints',
+        filename='website_generator-{epoch:02d}-{val_loss:.2f}',
+        save_top_k=3,
+        monitor='val_loss'
+    )
+    
+    trainer = pl.Trainer(
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=1,
+        max_epochs=args.num_epochs,
+        logger=WandbLogger(),
+        callbacks=[checkpoint_callback]
+    )
+    
+    return model, trainer
 
-def optimize_for_website(generated_text, url, text, prompt, description):
-    # Custom optimization techniques go here
-    # e.g., tone adjustment, keyword inclusion, readability improvement
-    optimized_text = generated_text
-    return optimized_text
+def generate_website_content(model: WebsiteContentGenerator, prompt: str, max_length: int = 200) -> str:
+    inputs = model.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True)
+    with torch.no_grad():
+        output_ids = model.model.llama.generate(
+            **inputs,
+            max_length=max_length,
+            num_return_sequences=1,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95
+        )[0]
+    return model.tokenizer.decode(output_ids, skip_special_tokens=True)
 
-prompt = "Write a product description for a new hiking backpack."
-generated_text = generate_website_content(model, prompt)
-optimized_text = optimize_for_website(generated_text, url, text, prompt, description)
-print(optimized_text)
+def optimize_for_website(text: str, **kwargs) -> str:
+    # Placeholder for future optimization logic
+    return text
+
+def main():
+    parser = argparse.ArgumentParser(description="Train and use a website content generator")
+    parser.add_argument("--llama_model_path", type=str, required=True, help="Path to the LLaMA model")
+    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate for training")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
+    parser.add_argument("--num_epochs", type=int, default=3, help="Number of epochs for training")
+    parser.add_argument("--mode", choices=['train', 'generate'], required=True, help="Mode of operation")
+    args = parser.parse_args()
+
+    if args.mode == 'train':
+        model, trainer = setup_training(args)
+        trainer.fit(model, train_dataloader, val_dataloader)  # You need to define these dataloaders
+    elif args.mode == 'generate':
+        model = WebsiteContentGenerator.load_from_checkpoint("path/to/your/checkpoint.ckpt")
+        while True:
+            prompt = input("Enter a prompt (or 'quit' to exit): ")
+            if prompt.lower() == 'quit':
+                break
+            generated_text = generate_website_content(model, prompt)
+            optimized_text = optimize_for_website(generated_text)
+            print("\nGenerated and Optimized Content:")
+            print(optimized_text)
+            print("\n" + "="*50 + "\n")
+
+if __name__ == "__main__":
+    main()
